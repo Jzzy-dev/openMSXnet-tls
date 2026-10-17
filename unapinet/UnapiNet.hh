@@ -3,13 +3,16 @@
 
 #include "MSXDevice.hh"
 #include "Socket.hh"
+#include "UnapiNetTls.hh"
 #include "UnapiNetWire.hh"
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <concepts>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -92,6 +95,16 @@ private:
 		uint16_t remotePort = 0;
 		uint16_t localPort = 0;
 		bool     connecting = false;
+		// TLS (flag bit 2 in TCP_OPEN). 'tls' may only be used, created or
+		// reset while UnapiNetTls::globalMutex() is held.
+		bool     wantTls = false;
+		bool     tlsVerify = false;
+		bool     handshaking = false; // connected, TLS handshake running
+		bool     tlsWantWrite = false; // receiver thread only
+		bool     tlsEof = false;       // peer closed the TLS stream
+		std::string tlsHost;
+		std::unique_ptr<UnapiNetTls> tls;
+		std::chrono::steady_clock::time_point openTime;
 		std::deque<uint8_t> recvBuf; // guarded by 'mutex'
 		std::mutex mutex; // protects recvBuf only. tcpState is atomic; the
 		                  // remaining metadata fields are plain and shared
@@ -212,6 +225,10 @@ private:
 	// the reason, close the socket and mark it CLOSED (does not clear the
 	// remote/local metadata — that is closeTcp's job).
 	void forceClose(TcpConnection& c, CloseReason reason);
+	// TLS steps of the receiver thread
+	void tlsStart(TcpConnection& c);
+	void tlsHandshakeStep(TcpConnection& c);
+	void tlsReceive(TcpConnection& c);
 	[[nodiscard]] int allocUdpHandle();
 	[[nodiscard]] UdpConnection* udpForHandle(int wireHandle);
 	void closeUdp(UdpConnection& u);

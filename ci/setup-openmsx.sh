@@ -30,7 +30,8 @@ cd "${OPENMSX_DIR}"
 # build/main.mk via `find src -type d`, so no makefile registration needed.
 mkdir -p src/unapinet share/extensions
 cp "${ROOT}/unapinet/UnapiNet.hh" "${ROOT}/unapinet/UnapiNet.cc" \
-   "${ROOT}/unapinet/UnapiNetWire.hh" src/unapinet/
+   "${ROOT}/unapinet/UnapiNetWire.hh" \
+   "${ROOT}/unapinet/UnapiNetTls.hh" "${ROOT}/unapinet/UnapiNetTls.cc" src/unapinet/
 cp "${ROOT}/unapinet/unapinet.xml" share/extensions/
 
 # Register the device class in DeviceFactory.cc (idempotent).
@@ -163,6 +164,66 @@ new = ("ifneq ($(filter mingw%,$(OPENMSX_TARGET_OS)),)\n"
        "endif\n")
 if old in s:
     p.write_text(s.replace(old, new))
+PY
+
+# --- mbedTLS (TLS for UnapiNet TCP connections) -----------------------------
+# Downloaded once, checked against its SHA-256, and built as three static
+# libraries with the plain Makefile (no cmake, no python) using the compiler
+# of the target. Rebuilt when the target changes. Override the compiler with
+# MBEDTLS_CC / MBEDTLS_AR if needed.
+MBEDTLS_VERSION="3.6.7"
+MBEDTLS_SHA256="a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6"
+MBEDTLS_URL="https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2"
+case "${OPENMSX_TARGET_OS}" in
+    mingw*)
+        case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*) MB_CC_DEF=gcc; MB_AR_DEF=ar ;;   # native MSYS2
+            *) MB_CC_DEF=x86_64-w64-mingw32-gcc; MB_AR_DEF=x86_64-w64-mingw32-ar ;;
+        esac ;;
+    darwin) MB_CC_DEF=clang; MB_AR_DEF=ar ;;
+    *)      MB_CC_DEF=gcc;   MB_AR_DEF=ar ;;
+esac
+MBEDTLS_CC="${MBEDTLS_CC:-${MB_CC_DEF}}"
+MBEDTLS_AR="${MBEDTLS_AR:-${MB_AR_DEF}}"
+if [ ! -f mbedtls/include/mbedtls/ssl.h ]; then
+    curl -fsSL -o mbedtls.tar.bz2 "${MBEDTLS_URL}"
+    if command -v sha256sum >/dev/null 2>&1; then
+        SUM="$(sha256sum mbedtls.tar.bz2 | cut -d' ' -f1)"
+    else
+        SUM="$(shasum -a 256 mbedtls.tar.bz2 | cut -d' ' -f1)"
+    fi
+    if [ "${SUM}" != "${MBEDTLS_SHA256}" ]; then
+        echo "mbedTLS download has the wrong SHA-256 (${SUM})" >&2
+        exit 1
+    fi
+    rm -rf mbedtls && mkdir mbedtls
+    tar xjf mbedtls.tar.bz2 -C mbedtls --strip-components=1
+    rm -f mbedtls.tar.bz2
+fi
+MB_STAMP="${OPENMSX_TARGET_OS} ${MBEDTLS_CC} ${MBEDTLS_VERSION}"
+if [ ! -f mbedtls/library/libmbedcrypto.a ] || [ "$(cat mbedtls/.openmsxnet-target 2>/dev/null)" != "${MB_STAMP}" ]; then
+    make -C mbedtls/library clean >/dev/null 2>&1 || true
+    make -C mbedtls/library -j4 CC="${MBEDTLS_CC}" AR="${MBEDTLS_AR}" \
+        libmbedtls.a libmbedx509.a libmbedcrypto.a
+    echo "${MB_STAMP}" > mbedtls/.openmsxnet-target
+fi
+
+# Compile and link openMSX against it (idempotent).
+python3 - <<'PY'
+import pathlib
+p = pathlib.Path("build/main.mk")
+s = p.read_text()
+anchor = "LINK_FLAGS+=$(LIBRARY_LINK_FLAGS)\n"
+if "openMSXnet mbedTLS" not in s:
+    assert anchor in s
+    s = s.replace(anchor, anchor +
+        "\n# openMSXnet mbedTLS - TLS for the UnapiNet device (built by ci/setup-openmsx.sh)\n"
+        "COMPILE_FLAGS+=-Imbedtls/include\n"
+        "LINK_FLAGS+=mbedtls/library/libmbedtls.a mbedtls/library/libmbedx509.a mbedtls/library/libmbedcrypto.a\n"
+        "ifneq ($(filter mingw%,$(OPENMSX_TARGET_OS)),)\n"
+        "LINK_FLAGS+=-lbcrypt -lcrypt32\n"
+        "endif\n", 1)
+    p.write_text(s)
 PY
 
 # Windows MSYS2 patches.

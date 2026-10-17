@@ -18,6 +18,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstring>
+#include <iostream>
 
 // Socket handles are openMSX SOCKET values (see Socket.hh); no casts needed.
 
@@ -34,7 +35,16 @@ namespace openmsx {
 // Bits 0,2,3,10 = PING + DNS + TCP active + UDP
 // Byte 1: bridge version
 static constexpr uint8_t CAP_BYTE0 = 0x0F; // PING + DNS + TCP + UDP caps summary
-static constexpr uint8_t CAP_BYTE1 = 0x04; // bridge version 4
+static constexpr uint8_t CAP_BYTE1 = 0x05; // bridge version 5 = TLS in TCP_OPEN
+
+// TCP_OPEN flag bits (UNAPI TCP/IP 1.1 and the ESP8266 UNAPI firmware)
+static constexpr uint8_t TCP_FLAG_PASSIVE  = 0x01;
+static constexpr uint8_t TCP_FLAG_RESIDENT = 0x02;
+static constexpr uint8_t TCP_FLAG_TLS      = 0x04; // encrypt, host name follows the 11 bytes
+static constexpr uint8_t TCP_FLAG_VERIFY   = 0x08; // check the server certificate
+
+// Give up on a TLS handshake after this long
+static constexpr auto TLS_HANDSHAKE_TIMEOUT = std::chrono::seconds(20);
 
 // Maximum transfer size per TCP_SEND/TCP_RECV command
 static constexpr size_t MAX_TRANSFER = 4096;
@@ -225,6 +235,17 @@ UnapiNet::UdpConnection* UnapiNet::udpForHandle(int wireHandle)
 
 void UnapiNet::closeTcp(TcpConnection& c)
 {
+	{
+		std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+		if (c.tls && c.sock != OPENMSX_INVALID_SOCKET && !c.handshaking) {
+			c.tls->closeNotify();
+		}
+		c.tls.reset();
+	}
+	c.wantTls      = false;
+	c.handshaking  = false;
+	c.tlsWantWrite = false;
+	c.tlsEof       = false;
 	if (c.sock != OPENMSX_INVALID_SOCKET) {
 		sock_close(static_cast<SOCKET>(c.sock));
 		c.sock = OPENMSX_INVALID_SOCKET;
@@ -267,6 +288,102 @@ void UnapiNet::forceClose(TcpConnection& c, CloseReason reason)
 	}
 	c.tcpState   = TcpState::Closed;
 	c.connecting = false;
+	c.handshaking = false;
+	// c.tls is NOT freed here (the caller may hold the TLS lock); closeTcp()
+	// or the next TCP_OPEN on this handle does that.
+}
+
+// --- TLS steps, receiver thread ---------------------------------------------
+
+void UnapiNet::tlsStart(TcpConnection& c)
+{
+	std::string error;
+	bool ok;
+	{
+		std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+		c.tls = UnapiNetTls::create(c.sock, c.tlsHost, c.tlsVerify, error);
+		ok = c.tls != nullptr;
+	}
+	if (!ok) {
+		std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << error << '\n';
+		forceClose(c, CloseReason::ConnectFailed);
+		return;
+	}
+	c.handshaking  = true; // tcpState stays SynSent until the handshake is done
+	c.tlsWantWrite = false;
+	tlsHandshakeStep(c);
+}
+
+void UnapiNet::tlsHandshakeStep(TcpConnection& c)
+{
+	UnapiNetTls::Status st;
+	std::string text;
+	{
+		std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+		if (!c.tls) { forceClose(c, CloseReason::ConnectFailed); return; }
+		st = c.tls->handshake();
+		text = (st == UnapiNetTls::Status::Done) ? c.tls->info() : c.tls->lastError();
+	}
+	switch (st) {
+	case UnapiNetTls::Status::Done:
+		c.handshaking = false;
+		c.tcpState    = TcpState::Established;
+		std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << text
+		          << (c.tlsVerify ? ", certificate verified\n" : ", certificate not checked\n");
+		break;
+	case UnapiNetTls::Status::WantRead:
+	case UnapiNetTls::Status::WantWrite:
+		c.tlsWantWrite = (st == UnapiNetTls::Status::WantWrite);
+		if (std::chrono::steady_clock::now() - c.openTime > TLS_HANDSHAKE_TIMEOUT) {
+			std::cerr << "UnapiNet TLS: " << c.tlsHost << " - handshake timeout\n";
+			forceClose(c, CloseReason::ConnectFailed);
+		}
+		break;
+	case UnapiNetTls::Status::Error:
+		std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << text << '\n';
+		forceClose(c, CloseReason::ConnectFailed);
+		break;
+	}
+}
+
+void UnapiNet::tlsReceive(TcpConnection& c)
+{
+	if (c.tlsEof) return;
+	for (int round = 0; round < 32; ++round) { // at most 16 KiB per pass
+		size_t room;
+		{
+			std::scoped_lock lock(c.mutex);
+			room = MAX_RECV_BUF - std::min(MAX_RECV_BUF, c.recvBuf.size());
+		}
+		if (room == 0) return; // the rest waits inside mbedTLS / the socket
+		uint8_t buf[512];
+		ptrdiff_t n;
+		std::string error;
+		{
+			std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+			if (!c.tls) return;
+			n = c.tls->read(buf, std::min(sizeof(buf), room));
+			if (n == -2) error = c.tls->lastError();
+		}
+		if (n > 0) {
+			std::scoped_lock lock(c.mutex);
+			c.recvBuf.insert(c.recvBuf.end(), buf, buf + n);
+		} else if (n == 0) {
+			return; // nothing more right now
+		} else if (n == -1) {
+			// Peer closed (close_notify or EOF). Same as the plain path,
+			// where sock_recv() reports EOF as an error - the socket is
+			// closed, the handle becomes free, data already received
+			// stays readable.
+			c.tlsEof = true;
+			forceClose(c, CloseReason::ConnectionReset);
+			return;
+		} else {
+			std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << error << '\n';
+			forceClose(c, CloseReason::ConnectionReset);
+			return;
+		}
+	}
 }
 
 void UnapiNet::receiverLoop()
@@ -290,6 +407,11 @@ void UnapiNet::receiverLoop()
 				// the exception set (Windows).
 				FD_SET(c.sock, &wfds);
 				FD_SET(c.sock, &efds);
+			} else if (c.handshaking) {
+				FD_SET(c.sock, &rfds);
+				if (c.tlsWantWrite) FD_SET(c.sock, &wfds);
+			} else if (c.wantTls && c.tlsEof) {
+				continue; // TLS stream ended, an EOF socket would wake select() forever
 			} else {
 				FD_SET(c.sock, &rfds);
 			}
@@ -308,9 +430,17 @@ void UnapiNet::receiverLoop()
 			continue;
 		}
 		struct timeval tv = {0, 100000}; // 100 ms
-		if (select(static_cast<int>(maxSock) + 1, &rfds, &wfds, &efds, &tv) <= 0) {
-			continue; // timeout or error: re-check running and rebuild the set
+		int sel = select(static_cast<int>(maxSock) + 1, &rfds, &wfds, &efds, &tv);
+		if (sel < 0) {
+			// e.g. a socket was closed by the emulation thread meanwhile;
+			// rebuild the set, but do not spin
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			continue;
 		}
+		// On a timeout (sel == 0) the sets are empty, but the TLS
+		// connections below are still serviced: decrypted data can wait
+		// inside mbedTLS without the socket being readable, and the
+		// handshake timeout has to be checked.
 
 		for (auto& c : tcp) {
 			if (c.sock == OPENMSX_INVALID_SOCKET) continue;
@@ -322,12 +452,27 @@ void UnapiNet::receiverLoop()
 					forceClose(c, CloseReason::ConnectFailed);
 				} else if (FD_ISSET(sd, &wfds)) {
 					int err = sock_getIntOption(sd, SOL_SOCKET, SO_ERROR);
-					if (err == 0) {
+					if (err == 0 && c.wantTls) {
+						c.connecting = false;
+						tlsStart(c); // stays SynSent until the handshake is done
+					} else if (err == 0) {
 						c.tcpState   = TcpState::Established;
 						c.connecting = false;
 					} else {
 						forceClose(c, CloseReason::ConnectFailed);
 					}
+				}
+				continue;
+			}
+
+			if (c.handshaking) {
+				tlsHandshakeStep(c);
+				continue;
+			}
+			if (c.wantTls) {
+				if (c.tcpState.load() == one_of(TcpState::Established,
+				                                TcpState::CloseWait)) {
+					tlsReceive(c);
 				}
 				continue;
 			}
@@ -557,7 +702,11 @@ void UnapiNet::cmdDnsStatus()
 
 // TCP_OPEN (0x03)
 // Params: IP[4] + remote_port[2 LE] + local_port[2 LE] + timeout[2] + flags[1]
+//         [+ host name + 00h, only with flag bit 2]
 // Flags bit 0: passive mode (listen). bit 1: resident.
+//       bit 2: TLS (client only). bit 3: verify the server certificate.
+// A TLS connection reports SYN_SENT until the handshake is done; a failed
+// handshake ends in CLOSED with close reason 6 (connect failed).
 // Result: 1 byte handle (1-4, or 0 on error)
 
 void UnapiNet::cmdTcpOpen()
@@ -572,8 +721,18 @@ void UnapiNet::cmdTcpOpen()
 	uint16_t remotePort   = p.remotePort;
 	uint16_t localPortReq = p.localPort;
 	uint8_t  flags        = p.flags;
-	bool passive  = (flags & 0x01) != 0;
-	bool resident = (flags & 0x02) != 0;
+	bool passive  = (flags & TCP_FLAG_PASSIVE) != 0;
+	bool resident = (flags & TCP_FLAG_RESIDENT) != 0;
+	// TLS only for active (client) connections. The host name (0 terminated)
+	// follows the 11 parameter bytes; it is used for SNI and the name check.
+	bool useTls   = !passive && (flags & TCP_FLAG_TLS) != 0;
+	bool verify   = useTls && (flags & TCP_FLAG_VERIFY) != 0;
+	std::string host;
+	if (useTls) {
+		for (size_t i = sizeof(TcpOpenParams); i < paramBuf.size() && paramBuf[i] != 0 && host.size() < 255; ++i) {
+			host.push_back(static_cast<char>(paramBuf[i]));
+		}
+	}
 
 	int h = allocTcpHandle();
 	if (h == INVALID_HANDLE) {
@@ -582,6 +741,17 @@ void UnapiNet::cmdTcpOpen()
 	}
 
 	auto& c = tcp[h];
+	{
+		std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+		c.tls.reset(); // left over from a connection that failed
+	}
+	c.wantTls      = useTls;
+	c.tlsVerify    = verify;
+	c.tlsHost      = host;
+	c.handshaking  = false;
+	c.tlsWantWrite = false;
+	c.tlsEof       = false;
+	c.openTime     = std::chrono::steady_clock::now();
 
 	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (s == OPENMSX_INVALID_SOCKET) {
@@ -628,7 +798,13 @@ void UnapiNet::cmdTcpOpen()
 		// Active connect
 		sockaddr_in dest = sock_makeIPv4(ip, remotePort);
 		int ret = connect(s, reinterpret_cast<struct sockaddr*>(&dest), sizeof(dest));
-		if (ret == 0) {
+		if (ret == 0 && useTls) {
+			// connected at once (localhost); let the receiver thread
+			// see it as a finished connect() and start the handshake
+			c.sock       = s;
+			c.tcpState   = TcpState::SynSent;
+			c.connecting = true;
+		} else if (ret == 0) {
 			c.sock       = s;
 			c.tcpState   = TcpState::Established;
 			c.connecting = false;
@@ -704,6 +880,46 @@ void UnapiNet::cmdTcpSend()
 	// Send data
 	const char* data = reinterpret_cast<const char*>(paramBuf.data() + sizeof(TcpSendParamHeader));
 	size_t sent = 0;
+	if (c.wantTls) {
+		while (sent < len) {
+			ptrdiff_t n;
+			bool wantWrite = false;
+			std::string error;
+			{
+				std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+				if (!c.tls) { setResultByte(1); return; }
+				n = c.tls->write(reinterpret_cast<const uint8_t*>(data + sent), len - sent);
+				if (n == 0) wantWrite = c.tls->wantWrite();
+				if (n < 0) error = c.tls->lastError();
+			}
+			if (n < 0) {
+				std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << error << '\n';
+				forceClose(c, CloseReason::ConnectionReset);
+				setResultByte(1);
+				return;
+			}
+			if (n == 0) {
+				// wait (bounded) until the socket can take more, then retry
+				// with the same data, as mbedTLS requires
+				fd_set fds;
+				FD_ZERO(&fds);
+				FD_SET(c.sock, &fds);
+				timeval tv = {2, 0};
+				int r = wantWrite
+					? select(static_cast<int>(c.sock) + 1, nullptr, &fds, nullptr, &tv)
+					: select(static_cast<int>(c.sock) + 1, &fds, nullptr, nullptr, &tv);
+				if (r <= 0) {
+					forceClose(c, CloseReason::ConnectionReset);
+					setResultByte(1);
+					return;
+				}
+				continue;
+			}
+			sent += static_cast<size_t>(n);
+		}
+		setResultByte(0); // OK
+		return;
+	}
 	while (sent < len) {
 		auto n = sock_send(c.sock, data + sent, len - sent);
 		if (n < 0) {
@@ -804,6 +1020,11 @@ void UnapiNet::cmdTcpClose()
 	if (c.sock == OPENMSX_INVALID_SOCKET) {
 		setResultByte(1);
 		return;
+	}
+
+	if (c.wantTls && !c.handshaking) {
+		std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+		if (c.tls) c.tls->closeNotify(); // TLS goodbye before the FIN
 	}
 
 	// Graceful shutdown: just FIN; let recvLoop detect remote close

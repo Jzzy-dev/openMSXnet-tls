@@ -95,7 +95,29 @@ Verified against:
 
 - Save states do not preserve socket state; open connections are lost on
   load.
-- TLS is not supported. Plain HTTP/HTTPS clients work for `http://` only.
+- TLS is available to bridge clients (see below), but `UNAPINET.COM` does
+  not pass the TLS flag yet, so Nextor programs still work for `http://` only.
+
+### TLS (bridge version 5)
+
+The bridge can encrypt a TCP client connection on the host side with
+[mbedTLS](https://github.com/Mbed-TLS/mbedtls) 3.6. The MSX program keeps
+sending and receiving plain data; it only has to ask for TLS when it opens
+the connection, the same way as with the ESP8266 UNAPI firmware:
+
+- `TCP_OPEN` flag bit 2 = TLS, bit 3 = verify the server certificate.
+- With bit 2 set, the host name follows the 11 parameter bytes, terminated
+  by 00h. It is sent as SNI and, with bit 3, checked against the certificate.
+- While the handshake runs, `TCP_STATE` reports SYN_SENT (2). A failed
+  handshake ends in CLOSED with close reason 6, like a refused connection.
+  The reason is printed on the openMSX console (stderr), for example
+  `UnapiNet TLS: example.com - TLSv1.3 ..., certificate verified`.
+- Root certificates come from the host - the Windows certificate store, or
+  the system bundle on Linux (`/etc/ssl/certs/ca-certificates.crt` and the
+  usual alternatives) and macOS (`/etc/ssl/cert.pem`). The environment
+  variable `UNAPINET_CA_FILE` (PEM file or directory) replaces them.
+- TLS 1.2 and 1.3, client connections only (passive opens stay plain).
+- `QUERY_CAP` returns 05h as second byte, so a driver can check for TLS.
 
 ## Repository layout
 
@@ -103,6 +125,7 @@ Verified against:
 unapinet/
   UnapiNet.hh           C++ device class declaration
   UnapiNet.cc           C++ device implementation
+  UnapiNetTls.hh/.cc    TLS client per connection (mbedTLS), root certificates
   unapinet.xml          openMSX device descriptor (claims I/O ports 28h-29h, same range as DenYoNet)
 
 msx/
@@ -130,6 +153,10 @@ patches. After it finishes, you run `make` in `openMSX/`.
   to `RELEASE_21_0`).
 - A C++17-capable compiler. On Windows this means the MSYS2 MINGW64
   toolchain.
+- mbedTLS 3.6.7 - downloaded (SHA-256 checked) and built as static
+  libraries by `ci/setup-openmsx.sh` with the target's C compiler, then
+  linked into openMSX (on Windows together with `bcrypt` and `crypt32`).
+  Nothing to install.
 - [Nestor80](https://github.com/Konamiman/Nestor80) Z80 assembler, for
   building `UNAPINET.COM`.
 - A Nextor 2.1.x ROM at runtime (RAM-helper that the TSR depends on);
@@ -264,7 +291,7 @@ all bytes from a previous call.
 | 00h  | `PING`         | -                                    | 1 byte: ABh                         |
 | 01h  | `DNS_QUERY`    | hostname + 00h                       | 1 byte status [+ 4 bytes IP]        |
 | 02h  | `DNS_STATUS`   | -                                    | 1 byte status [+ 4 bytes IP]        |
-| 03h  | `TCP_OPEN`     | IP[4] + port[2 LE]                   | 1 byte handle (0 = error)           |
+| 03h  | `TCP_OPEN`     | IP[4] + rport[2 LE] + lport[2 LE] + timeout[2] + flags [+ host name + 00h if flags bit 2] | 1 byte handle (0 = error) |
 | 04h  | `TCP_SEND`     | handle + len[2 LE] + data            | 1 byte status                       |
 | 05h  | `TCP_RECV`     | handle + maxlen[2 LE]                | len[2 LE] + data                    |
 | 06h  | `TCP_CLOSE`    | handle                               | 1 byte status                       |
@@ -277,7 +304,7 @@ all bytes from a previous call.
 | 0Dh  | `GET_LOCALIP`  | -                                    | 4 bytes IP (network order)          |
 | 0Eh  | `NET_STATE`    | -                                    | 1 byte (2 = open)                   |
 | 0Fh  | `UDP_RECV`     | handle + maxlen[2 LE]                | src_IP[4] + src_port[2 LE] + len[2 LE] + data |
-| 10h  | `QUERY_CAP`    | -                                    | 2 bytes: cap0, cap1                 |
+| 10h  | `QUERY_CAP`    | -                                    | 2 bytes: cap0, cap1 (bridge version, 05h = TLS) |
 | 11h  | `ICMP_SEND`    | IP[4] + TTL[1] + ID[2 LE] + SEQ[2 LE] + len[2 LE] | 1 byte status             |
 | 12h  | `ICMP_RECV`    | -                                    | has_data[1] + [IP[4]+TTL[1]+ID[2]+SEQ[2]+len[2]] |
 

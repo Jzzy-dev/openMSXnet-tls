@@ -351,8 +351,10 @@ is the first place to look when an MSX program misbehaves.
 - **Save states do not persist sockets.** Loading a save state while a
   TCP connection is open will leave the MSX side seeing a half-open
   connection. Close TCP connections before saving state.
-- **TLS is not supported.** Only `http://` works; `https://` URLs cannot
-  be retrieved.
+- **TLS is done by the bridge, not by UNAPINET.COM yet.** Software that
+  talks to the bridge directly (such as the SymbOS network daemon driver)
+  can open TLS connections; Nextor programs through `UNAPINET.COM` still
+  only reach `http://` URLs. See the TLS section of the README.
 - **One UNAPI implementation per system.** If another extension also
   installs an UNAPI TCP/IP implementation, MSX programs will use the
   first one they find via `EXTBIO`. Disable the other extension or
