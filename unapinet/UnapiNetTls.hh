@@ -66,6 +66,10 @@ public:
 	// Send close_notify (best effort, non-blocking).
 	void closeNotify();
 
+	// Close reason for the MSX after a failed handshake, as defined in the
+	// TCP/IP UNAPI 1.1 specification (10-17 certificate problems, 19 other).
+	[[nodiscard]] uint8_t closeReason() const;
+
 	// Human readable description of the last error.
 	[[nodiscard]] const std::string& lastError() const { return errorText; }
 
@@ -82,6 +86,7 @@ private:
 	struct Impl;
 	std::unique_ptr<Impl> impl;
 	bool lastWantWrite = false;
+	int lastRet = 0;
 	std::string errorText;
 };
 

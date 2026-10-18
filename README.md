@@ -95,8 +95,7 @@ Verified against:
 
 - Save states do not preserve socket state; open connections are lost on
   load.
-- TLS is available to bridge clients (see below), but `UNAPINET.COM` does
-  not pass the TLS flag yet, so Nextor programs still work for `http://` only.
+- TLS works for TCP client connections only (passive opens stay plain).
 
 ### TLS (bridge version 5)
 
@@ -108,9 +107,15 @@ the connection, the same way as with the ESP8266 UNAPI firmware:
 - `TCP_OPEN` flag bit 2 = TLS, bit 3 = verify the server certificate.
 - With bit 2 set, the host name follows the 11 parameter bytes, terminated
   by 00h. It is sent as SNI and, with bit 3, checked against the certificate.
+  Without a host name there is no SNI, and with bit 3 only the certificate
+  chain is checked, not the name (as the UNAPI spec defines for a zero host
+  name address).
 - While the handshake runs, `TCP_STATE` reports SYN_SENT (2). A failed
-  handshake ends in CLOSED with close reason 6, like a refused connection.
-  The reason is printed on the openMSX console (stderr), for example
+  handshake ends in CLOSED with the close reason of the TCP/IP UNAPI 1.1
+  spec - 11 host name mismatch, 12 expired, 13 self-signed, 14 untrusted
+  root, 15 revoked, 10 other certificate problem, 17 no common TLS version
+  or cipher, 19 other TLS error (6 for a handshake timeout). The details are
+  printed on the openMSX console (stderr), for example
   `UnapiNet TLS: example.com - TLSv1.3 ..., certificate verified`.
 - Root certificates come from the host - the Windows certificate store, or
   the system bundle on Linux (`/etc/ssl/certs/ca-certificates.crt` and the
@@ -118,6 +123,22 @@ the connection, the same way as with the ESP8266 UNAPI firmware:
   variable `UNAPINET_CA_FILE` (PEM file or directory) replaces them.
 - TLS 1.2 and 1.3, client connections only (passive opens stay plain).
 - `QUERY_CAP` returns 05h as second byte, so a driver can check for TLS.
+
+`UNAPINET.COM` (1.2) passes TLS on from the standard TCP/IP UNAPI 1.1 call,
+so Nextor programs that support https (for example `hget`) can use it:
+
+- `TCPIP_TCP_OPEN` flags bit 2 = use TLS, bit 3 = verify the certificate,
+  parameter block +11 = address of the host name (0 = none).
+- The spec defines +11 only together with bit 3. Without bit 3 the address
+  is still used as SNI, but only if it points to a plausible host name
+  (1-253 printable characters with a dot), since most servers need SNI.
+- `TCPIP_GET_CAPAB` announces TLS in active connections (block 4, bit 8)
+  and certificate verification (block 1, features bit 12) when the bridge
+  is version 5 or newer. `TCPIP_TCP_STATE` returns the TLS close reasons
+  in C.
+- Tested against the calls `hget` 1.3 makes. Its `/u` (no certificate
+  check) and `/n` (no host name check) options pass no host name, so no
+  SNI is sent then, which some servers refuse.
 
 ## Repository layout
 

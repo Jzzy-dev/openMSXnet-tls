@@ -306,7 +306,7 @@ void UnapiNet::tlsStart(TcpConnection& c)
 	}
 	if (!ok) {
 		std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << error << '\n';
-		forceClose(c, CloseReason::ConnectFailed);
+		forceClose(c, static_cast<CloseReason>(19)); // TLS - other error
 		return;
 	}
 	c.handshaking  = true; // tcpState stays SynSent until the handshake is done
@@ -324,6 +324,11 @@ void UnapiNet::tlsHandshakeStep(TcpConnection& c)
 		st = c.tls->handshake();
 		text = (st == UnapiNetTls::Status::Done) ? c.tls->info() : c.tls->lastError();
 	}
+	uint8_t reason = 19;
+	if (st == UnapiNetTls::Status::Error) {
+		std::scoped_lock tlsLock(UnapiNetTls::globalMutex());
+		if (c.tls) reason = c.tls->closeReason();
+	}
 	switch (st) {
 	case UnapiNetTls::Status::Done:
 		c.handshaking = false;
@@ -340,8 +345,9 @@ void UnapiNet::tlsHandshakeStep(TcpConnection& c)
 		}
 		break;
 	case UnapiNetTls::Status::Error:
-		std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << text << '\n';
-		forceClose(c, CloseReason::ConnectFailed);
+		std::cerr << "UnapiNet TLS: " << c.tlsHost << " - " << text
+		          << " (close reason " << int(reason) << ")\n";
+		forceClose(c, static_cast<CloseReason>(reason)); // UNAPI TLS close reasons 10-19
 		break;
 	}
 }
@@ -705,8 +711,11 @@ void UnapiNet::cmdDnsStatus()
 //         [+ host name + 00h, only with flag bit 2]
 // Flags bit 0: passive mode (listen). bit 1: resident.
 //       bit 2: TLS (client only). bit 3: verify the server certificate.
+// Host name empty or missing: no SNI; with bit 3 only the certificate chain
+// is checked, not the name (UNAPI TCP/IP 1.1, host name address zero).
 // A TLS connection reports SYN_SENT until the handshake is done; a failed
-// handshake ends in CLOSED with close reason 6 (connect failed).
+// handshake ends in CLOSED with the UNAPI TLS close reason (10-17, 19 other),
+// a handshake timeout with 6.
 // Result: 1 byte handle (1-4, or 0 on error)
 
 void UnapiNet::cmdTcpOpen()

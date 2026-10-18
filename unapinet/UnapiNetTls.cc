@@ -145,6 +145,7 @@ struct UnapiNetTls::Impl {
 	mbedtls_ctr_drbg_context drbg;
 	mbedtls_ssl_config conf;
 	mbedtls_ssl_context ssl;
+	bool selfSigned = false; // server certificate issued itself (for close reason 13)
 
 	Impl() {
 		mbedtls_entropy_init(&entropy);
@@ -163,10 +164,23 @@ struct UnapiNetTls::Impl {
 };
 
 UnapiNetTls::UnapiNetTls() : impl(std::make_unique<Impl>()) {}
+
+// Called by mbedTLS for each certificate of the chain while verifying. Only
+// notes whether the server's own certificate is self-signed; the result of
+// the verification itself is not changed.
+static int verifyNote(void* ctx, mbedtls_x509_crt* crt, int depth, uint32_t* /*flags*/)
+{
+	if (depth == 0 && crt->issuer_raw.len == crt->subject_raw.len &&
+	    std::memcmp(crt->issuer_raw.p, crt->subject_raw.p, crt->subject_raw.len) == 0) {
+		static_cast<bool*>(ctx)[0] = true;
+	}
+	return 0;
+}
 UnapiNetTls::~UnapiNetTls() = default;
 
 void UnapiNetTls::setError(const char* what, int ret)
 {
+	lastRet = ret;
 	char buf[160];
 	mbedtls_strerror(ret, buf, sizeof(buf));
 	errorText = std::string(what) + " - " + buf;
@@ -220,13 +234,17 @@ std::unique_ptr<UnapiNetTls> UnapiNetTls::create(
 		}
 		mbedtls_ssl_conf_authmode(&d.conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 		mbedtls_ssl_conf_ca_chain(&d.conf, &caChain, nullptr);
+		mbedtls_ssl_conf_verify(&d.conf, verifyNote, &d.selfSigned);
 	} else {
 		mbedtls_ssl_conf_authmode(&d.conf, MBEDTLS_SSL_VERIFY_NONE);
 	}
 	ret = mbedtls_ssl_setup(&d.ssl, &d.conf);
-	if (ret == 0 && !hostName.empty()) {
-		// SNI, and the name the certificate is checked against
-		ret = mbedtls_ssl_set_hostname(&d.ssl, hostName.c_str());
+	if (ret == 0) {
+		// SNI, and the name the certificate is checked against. Without a
+		// name, a verifying connection checks only the certificate chain
+		// (UNAPI TCP/IP 1.1, host name address zero); NULL tells mbedTLS
+		// that this is intended.
+		ret = mbedtls_ssl_set_hostname(&d.ssl, hostName.empty() ? nullptr : hostName.c_str());
 	}
 	if (ret != 0) {
 		t->setError("TLS setup", ret);
@@ -282,6 +300,27 @@ ptrdiff_t UnapiNetTls::write(const uint8_t* buf, size_t len)
 	if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) { lastWantWrite = true;  return 0; }
 	setError("TLS write", ret);
 	return -1;
+}
+
+uint8_t UnapiNetTls::closeReason() const
+{
+	switch (lastRet) {
+	case MBEDTLS_ERR_X509_CERT_VERIFY_FAILED: {
+		uint32_t f = mbedtls_ssl_get_verify_result(&impl->ssl);
+		if (f & MBEDTLS_X509_BADCERT_REVOKED) return 15;
+		if (f & (MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE)) return 12;
+		if (f & MBEDTLS_X509_BADCERT_NOT_TRUSTED) {
+			return impl->selfSigned ? 13 : 14; // self-signed / untrusted root
+		}
+		if (f & MBEDTLS_X509_BADCERT_CN_MISMATCH) return 11;
+		return 10;     // invalid certificate, other reason
+	}
+	case MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION:
+	case MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE:
+		return 17;     // no common TLS version or cipher suite
+	default:
+		return 19;     // other TLS error
+	}
 }
 
 std::string UnapiNetTls::info() const

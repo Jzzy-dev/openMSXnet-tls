@@ -29,7 +29,7 @@ ARG:    equ     0F847h
 API_V_P:        equ     1
 API_V_S:        equ     1
 ROM_V_P:        equ     1
-ROM_V_S:        equ     1
+ROM_V_S:        equ     2               ; 1.2 = TLS (bridge version 5)
 
 ; --- Max function number
 MAX_FN:         equ     18
@@ -58,6 +58,7 @@ CMD_NET_STATE:  equ     0Eh
 CMD_UDP_RECV:   equ     0Fh
 CMD_ICMP_SEND:  equ     11h
 CMD_ICMP_RECV:  equ     12h
+CMD_QUERY_CAP:  equ     10h
 
 ; --- Bridge status
 STATUS_OK:      equ     00h
@@ -613,7 +614,10 @@ FN_GET_CAPAB:
         ; bit10=UDP
         ld      hl,043Dh        ; 0x0400 | 0x0030 | 0x000C | 0x0001
         ld      de,043Dh
-        ld      b,0             ; link level: unknown
+        call    TLS_CHECK
+        jr      c,.cap1n
+        set     4,d             ; features bit 12: server certificate can be verified
+.cap1n: ld      b,0             ; link level: unknown
         xor     a
         ei
         ret
@@ -639,8 +643,27 @@ FN_GET_CAPAB:
 .cap4:  ; Second capabilities set
         ld      hl,0
         ld      de,0
-        xor     a
+        call    TLS_CHECK
+        jr      c,.cap4n
+        set     0,h             ; bit 8: TLS in TCP active connections
+.cap4n: xor     a
         ei
+        ret
+
+
+;--- TLS_CHECK: does the bridge do TLS (bridge version 5 or newer)?
+;    Output: CF=0 yes, CF=1 no. Keeps BC, DE, HL.
+
+TLS_CHECK:
+        ld      a,CMD_QUERY_CAP
+        out     (IO_CMD),a
+        in      a,(IO_CMD)
+        cp      STATUS_DATA
+        scf
+        ret     nz
+        in      a,(IO_DATA)     ; cap0
+        in      a,(IO_DATA)     ; cap1 = bridge version
+        cp      5               ; CF=1 below 5
         ret
 
 
@@ -872,8 +895,16 @@ FN_DNS_S:
 
 
 ;--- Function 13: TCPIP_TCP_OPEN
-;    Input: HL=param block ptr (11 bytes)
+;    Input: HL=param block ptr (11 bytes, 13 with TLS)
 ;    Output: A=err, B=handle
+;
+;    TLS (UNAPI TCP/IP 1.1): flags bit 2 = use TLS, bit 3 = verify the
+;    server certificate, +11 = address of the host name (0 = none). The
+;    bridge gets the host name right after the 11 bytes, 00h terminated;
+;    no name means no SNI and, with bit 3, a check of the chain only.
+;    The spec defines +11 only together with bit 3. Without bit 3 the
+;    address is still used, but only as SNI and only if it points to
+;    something that looks like a host name - most servers need SNI.
 
 FN_TCP_OPEN:
         ; Write full 11-byte param block to bridge:
@@ -884,6 +915,37 @@ FN_TCP_OPEN:
         inc     hl
         djnz    .to_lp
 
+        dec     hl
+        ld      a,(hl)          ; flags
+        inc     hl
+        bit     2,a
+        jr      z,.to_exec      ; plain TCP
+        bit     0,a
+        jr      nz,.to_exec     ; passive - the bridge does TLS for clients only
+        ld      c,a
+        ld      e,(hl)
+        inc     hl
+        ld      d,(hl)          ; DE = address of the host name
+        ld      a,d
+        or      e
+        jr      z,.to_exec      ; no host name
+        bit     3,c
+        jr      nz,.to_name     ; verify - the address is defined, use it
+        call    CHK_HOSTNAME    ; no verify - SNI only, if it looks right
+        jr      c,.to_exec
+.to_name:
+        ld      b,0             ; at most 255 characters
+.to_nm: ld      a,(de)
+        or      a
+        jr      z,.to_nmz
+        out     (IO_DATA),a
+        inc     de
+        djnz    .to_nm
+.to_nmz:
+        xor     a
+        out     (IO_DATA),a     ; terminator
+
+.to_exec:
         ld      a,CMD_TCP_OPEN
         out     (IO_CMD),a
 
@@ -902,6 +964,46 @@ FN_TCP_OPEN:
 .to_err:
         ld      a,ERR_NO_FREE_CONN
         ei
+        ret
+
+
+;--- CHK_HOSTNAME: does DE point to a plausible host name?
+;    1 to 253 characters 21h-7Eh with at least one dot, 00h terminated.
+;    Output: CF=0 yes, CF=1 no. Keeps DE.
+
+CHK_HOSTNAME:
+        push    de
+        ld      b,0             ; length
+        ld      c,0             ; dot seen
+.ch_lp: ld      a,(de)
+        or      a
+        jr      z,.ch_end
+        cp      '.'
+        jr      nz,.ch_nd
+        ld      c,1
+.ch_nd: cp      21h
+        jr      c,.ch_bad
+        cp      7Fh
+        jr      nc,.ch_bad
+        inc     de
+        inc     b
+        ld      a,b
+        cp      254
+        jr      nc,.ch_bad
+        jr      .ch_lp
+.ch_end:
+        ld      a,b
+        or      a
+        jr      z,.ch_bad
+        ld      a,c
+        or      a
+        jr      z,.ch_bad
+        pop     de
+        or      a               ; CF=0
+        ret
+.ch_bad:
+        pop     de
+        scf
         ret
 
 
