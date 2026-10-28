@@ -1,3 +1,18 @@
+# No more effort here , feel free to pick this up for TLS in OpenMSX without additional OpenSSL install or other shizzle
+
+Done.
+
+
+
+
+
+
+
+
+
+
+
+
 # openMSXnet
 
 First of all, many many thanks to @mcolom, because the idea of this project born thanks to him!
