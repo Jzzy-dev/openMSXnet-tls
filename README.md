@@ -1,17 +1,4 @@
-# No more effort here , feel free to pick this up for TLS in OpenMSX without additional OpenSSL install or other shizzle
-
-Done.
-
-
-
-
-
-
-
-
-
-
-
+Feel free to pick this up for TLS in OpenMSX!
 
 # openMSXnet
 
